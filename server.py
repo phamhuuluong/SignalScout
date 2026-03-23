@@ -58,6 +58,25 @@ _MT5_COMMON_FILE = os.path.expanduser(
     "/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/Files/mt5_hub.json"
 )
 
+# EA v3: DOM / Order Flow data file (updated every 5s)
+_MT5_ORDERFLOW_FILE = os.path.expanduser(
+    "~/Library/Application Support/net.metaquotes.wine.metatrader5"
+    "/drive_c/users/user/AppData/Roaming/MetaQuotes/Terminal/Common/Files/mt5_orderflow.json"
+)
+
+# In-memory DOM data cache (updated from file)
+_orderflow_data: dict = {"orderflow": [], "ts": 0, "ea_version": "—"}
+
+def _reload_orderflow_file():
+    """Doc file mt5_orderflow.json duoc ghi boi EA v3."""
+    global _orderflow_data
+    try:
+        if os.path.exists(_MT5_ORDERFLOW_FILE):
+            with open(_MT5_ORDERFLOW_FILE, "r", encoding="utf-8") as f:
+                _orderflow_data = _json.load(f)
+    except Exception:
+        pass
+
 # Load persisted data on startup
 try:
     with open(_MT5_PERSIST_FILE, "r") as f:
@@ -66,6 +85,9 @@ try:
         print(f"✅ Mỹ phục MT5 data: {len(_mt5_data['market'])} symbols | {_mt5_data.get('updated_at')}")
 except Exception:
     pass
+
+_reload_orderflow_file()
+
 
 
 def get_cached(key: str):
