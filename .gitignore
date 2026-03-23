@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+hub_data.db
+.env
+*.log
+nohup.out
+.DS_Store
+venv/

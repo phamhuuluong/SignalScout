@@ -1,0 +1,16 @@
+tunnel: 22332de5-791d-4e37-bb05-bd3c1317e464
+credentials-file: /root/.cloudflared/22332de5-791d-4e37-bb05-bd3c1317e464.json
+
+originRequest:
+  noTLSVerify: false
+
+ingress:
+  # ATTRAOS Hub — iOS app + MT5 EA + Admin panel
+  - hostname: hub.lomofx.com
+    service: http://localhost:8001
+  # Legacy bot copy (giữ nguyên nếu còn dùng)
+  - hostname: api.lomofx.com
+    service: http://localhost:8000
+  - hostname: manage.lomofx.com
+    service: http://localhost:8001
+  - service: http_status:404

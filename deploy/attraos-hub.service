@@ -1,0 +1,24 @@
+[Unit]
+Description=ATTRAOS Hub Server (AI Trading Signal Hub)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu                            # ← thay bằng user VPS của anh
+WorkingDirectory=/home/ubuntu/SignalScout
+ExecStart=/home/ubuntu/venv/bin/python3 server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=attraos-hub
+
+# Environment variables
+Environment="PORT=8001"
+Environment="HOST=0.0.0.0"
+Environment="GEMINI_API_KEY=your_gemini_key_here"
+Environment="DEEPSEEK_API_KEY=your_deepseek_key_here"
+
+[Install]
+WantedBy=multi-user.target
