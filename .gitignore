@@ -7,3 +7,4 @@ hub_data.db
 nohup.out
 .DS_Store
 venv/
+keys/
