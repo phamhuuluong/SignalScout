@@ -120,6 +120,24 @@ async def lifespan(app: FastAPI):
         from bookmap_council import council_background_loop
         council_task = asyncio.create_task(council_background_loop(market))
         print("   Council:    ✅ (3-Stage AI Council — 5min refresh)")
+        # Load AI keys từ DB vào env (để sống qua restart)
+        try:
+            from hub_database import SessionLocal, get_config
+            _db = SessionLocal()
+            _key_map = {
+                "ai_key_gemini":   "GEMINI_API_KEY",
+                "ai_key_deepseek": "DEEPSEEK_API_KEY",
+                "ai_key_openai":   "OPENAI_API_KEY",
+            }
+            for db_key, env_key in _key_map.items():
+                val = get_config(_db, db_key, "")
+                if val and not os.environ.get(env_key):
+                    os.environ[env_key] = val
+            _db.close()
+            print("   AI Keys:    ✅ (loaded from DB)")
+        except Exception as _ke:
+            print(f"   AI Keys:    ⚠️ {_ke}")
+
     except Exception as e:
         council_task = None
         print(f"   Council:    ⚠️ {e}")

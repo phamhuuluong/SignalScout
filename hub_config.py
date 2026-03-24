@@ -154,3 +154,83 @@ async def update_prompt(
     _config_cache = {}
     _config_cache_time = 0
     return {"status": "ok", "name": name}
+
+
+# ── AI Keys Management ─────────────────────────────────────────────────────
+# Admin có thể set key từ iOS app hoặc web — không cần SSH vào VPS
+
+AI_KEY_NAMES = {
+    "gemini":   "ai_key_gemini",
+    "deepseek": "ai_key_deepseek",
+    "openai":   "ai_key_openai",
+}
+
+
+class AIKeyUpdate(BaseModel):
+    provider: str   # gemini | deepseek | openai
+    key: str        # API key value
+
+
+@router.get("/admin/ai-keys")
+async def list_ai_keys(
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin),
+):
+    """List all AI key providers (masked) for admin dashboard."""
+    result = {}
+    for provider, db_key in AI_KEY_NAMES.items():
+        val = get_config(db, db_key, "")
+        result[provider] = {
+            "configured": bool(val),
+            "masked": (val[:8] + "..." + val[-4:]) if len(val) > 12 else ("***" if val else ""),
+        }
+    return {"ai_keys": result}
+
+
+@router.post("/admin/ai-keys")
+async def set_ai_key(
+    body: AIKeyUpdate,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin),
+):
+    """
+    Set API key cho AI provider (gemini / deepseek / openai).
+    Key được lưu vào DB — bookmap_council.py sẽ đọc tự động.
+    Không cần SSH hay restart server.
+    """
+    provider = body.provider.lower()
+    if provider not in AI_KEY_NAMES:
+        raise HTTPException(400, f"Provider không hợp lệ. Chọn: {list(AI_KEY_NAMES.keys())}")
+    db_key = AI_KEY_NAMES[provider]
+    set_config(db, db_key, body.key)
+    # Apply vào os.environ ngay để Council dùng được không cần restart
+    import os
+    env_map = {
+        "gemini":   "GEMINI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "openai":   "OPENAI_API_KEY",
+    }
+    os.environ[env_map[provider]] = body.key
+    return {
+        "status": "ok",
+        "provider": provider,
+        "applied": True,
+        "message": f"✅ {provider.title()} API key đã được lưu và kích hoạt ngay. Hội Đồng AI sẽ dùng trong lần phân tích tiếp theo."
+    }
+
+
+@router.delete("/admin/ai-keys/{provider}")
+async def delete_ai_key(
+    provider: str,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_admin),
+):
+    """Xóa API key của provider."""
+    import os
+    provider = provider.lower()
+    if provider not in AI_KEY_NAMES:
+        raise HTTPException(400, f"Provider không hợp lệ")
+    set_config(db, AI_KEY_NAMES[provider], "")
+    env_map = {"gemini": "GEMINI_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}
+    os.environ.pop(env_map.get(provider, ""), None)
+    return {"status": "ok", "provider": provider, "message": f"{provider} key đã xóa."}
