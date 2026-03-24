@@ -102,6 +102,58 @@ def find_signals(candles: list) -> list:
     return signals[-8:]  # Chỉ show 8 signals gần nhất
 
 
+def compute_volume_profile(candles: list, n_levels: int = 80):
+    """
+    Tính Volume Profile từ OHLCV thật.
+    Phân bổ volume của mỗi nến theo các mức giá trong range high-low.
+    Không random — 100% từ data thật.
+    """
+    if not candles:
+        return {}, 0, 0, 0
+
+    all_highs = [c["h"] for c in candles]
+    all_lows  = [c["l"] for c in candles]
+    price_min = min(all_lows)
+    price_max = max(all_highs)
+    price_range = price_max - price_min
+    if price_range < 0.0001:
+        return {}, price_min, price_max, price_min
+
+    # Tạo các mức giá (price levels)
+    tick = price_range / n_levels
+    levels = [price_min + i * tick for i in range(n_levels + 1)]
+    profile = {lvl: 0.0 for lvl in levels}
+
+    for c in candles:
+        candle_range = max(c["h"] - c["l"], 0.0001)
+        # Distribute volume proportionally across all price levels in candle range
+        for lvl in levels:
+            if c["l"] <= lvl <= c["h"]:
+                # Weight by proximity to close (more volume near close = typical assumption)
+                dist_to_close = abs(lvl - c["c"])
+                weight = 1.0 - (dist_to_close / candle_range) * 0.5
+                profile[lvl] += c["v"] * weight * (tick / candle_range)
+
+    # Find POC (Point of Control) — price with most volume
+    poc_price = max(profile, key=profile.get)
+
+    # Value Area (70% of total volume)
+    total_vol = sum(profile.values())
+    target_vol = total_vol * 0.70
+    sorted_levels = sorted(profile.items(), key=lambda x: x[1], reverse=True)
+    cumvol = 0.0
+    va_prices = []
+    for p, v in sorted_levels:
+        cumvol += v
+        va_prices.append(p)
+        if cumvol >= target_vol:
+            break
+    vah = max(va_prices) if va_prices else price_max
+    val = min(va_prices) if va_prices else price_min
+
+    return profile, price_min, price_max, poc_price, vah, val, tick
+
+
 def generate_chart(
     candles_m15: list,
     symbol: str = "XAUUSD",
@@ -109,16 +161,15 @@ def generate_chart(
     n_candles: int = 60,
 ) -> Optional[str]:
     """
-    Vẽ biểu đồ nến thật gồm 3 panel:
-    - Panel 1 (lớn): Japanese Candlestick chart + EMA20
-    - Panel 2 (nhỏ): Volume histogram (xanh/đỏ theo hướng nến)
-    - Panel 3 (nhỏ): CVD line (Cumulative Volume Delta thật)
+    Vẽ biểu đồ thật gồm 2 phần:
+    LEFT (75%): Candlestick M15 + EMA + Volume + CVD
+    RIGHT (25%): Volume Profile Heatmap (bản đồ nhiệt theo mức giá)
+                 POC + Value Area + màu inferno theo volume
     """
     candles = parse_candles(candles_m15)
     if len(candles) < 10:
         return None
 
-    # Lấy N nến gần nhất
     candles = candles[-n_candles:]
     n = len(candles)
     xs = list(range(n))
@@ -132,39 +183,51 @@ def generate_chart(
     cvd    = compute_cvd(candles)
     signals = find_signals(candles)
 
-    # EMA 20
+    # Volume Profile
+    vp_result = compute_volume_profile(candles, n_levels=100)
+    if len(vp_result) == 7:
+        vp_profile, vp_min, vp_max, poc_price, vah, val, vp_tick = vp_result
+    else:
+        vp_profile, vp_min, vp_max, poc_price = {}, min(lows), max(highs), closes[-1]
+        vah, val, vp_tick = vp_max, vp_min, (vp_max-vp_min)/100
+
+    # EMA
     def ema(prices, period):
-        result = [None] * period
         k = 2 / (period + 1)
-        val = np.mean(prices[:period])
-        result = [None] * (period - 1) + [val]
+        val_ema = np.mean(prices[:period])
+        result = [None] * (period - 1) + [val_ema]
         for i in range(period, len(prices)):
-            val = prices[i] * k + val * (1 - k)
-            result.append(val)
+            val_ema = prices[i] * k + val_ema * (1 - k)
+            result.append(val_ema)
         return result
 
     ema20 = ema(closes, min(20, n))
     ema50 = ema(closes, min(50, n))
 
-    # ── Figure setup ──────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(18, 10), facecolor=COLOR_BG)
+    # ── Figure: 2-column layout ───────────────────────────────────────────
+    fig = plt.figure(figsize=(22, 11), facecolor=COLOR_BG)
     fig.patch.set_facecolor(COLOR_BG)
 
-    gs = gridspec.GridSpec(3, 1, height_ratios=[5, 1.5, 1.5],
-                           hspace=0.06, left=0.06, right=0.97,
-                           top=0.92, bottom=0.07)
+    # Left: 3 rows (candle/vol/cvd); Right: 1 row (heatmap)
+    outer_gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1],
+                                 left=0.05, right=0.98,
+                                 top=0.92, bottom=0.07,
+                                 wspace=0.02)
+    left_gs = gridspec.GridSpecFromSubplotSpec(
+        3, 1, subplot_spec=outer_gs[0],
+        height_ratios=[5, 1.5, 1.5], hspace=0.05)
 
-    ax_candle = fig.add_subplot(gs[0])
-    ax_vol    = fig.add_subplot(gs[1], sharex=ax_candle)
-    ax_cvd    = fig.add_subplot(gs[2], sharex=ax_candle)
+    ax_candle = fig.add_subplot(left_gs[0])
+    ax_vol    = fig.add_subplot(left_gs[1], sharex=ax_candle)
+    ax_cvd    = fig.add_subplot(left_gs[2], sharex=ax_candle)
+    ax_heat   = fig.add_subplot(outer_gs[1])
 
-    for ax in [ax_candle, ax_vol, ax_cvd]:
+    for ax in [ax_candle, ax_vol, ax_cvd, ax_heat]:
         ax.set_facecolor(COLOR_CARD)
         ax.tick_params(colors=COLOR_MUTED, labelsize=8)
-        ax.yaxis.label.set_color(COLOR_MUTED)
         for spine in ax.spines.values():
             spine.set_edgecolor(COLOR_GRID)
-        ax.grid(True, color=COLOR_GRID, linewidth=0.5, alpha=0.6)
+        ax.grid(True, color=COLOR_GRID, linewidth=0.4, alpha=0.5)
 
     # ── Candlestick ──────────────────────────────────────────────────────
     candle_width  = 0.6
@@ -227,6 +290,7 @@ def generate_chart(
                      labelcolor=COLOR_TEXT, framealpha=0.9)
 
     # ── Volume bars ──────────────────────────────────────────────────────
+    candle_width = 0.6
     for i in xs:
         color = COLOR_VOL_BULL if closes[i] >= opens[i] else COLOR_VOL_BEAR
         ax_vol.bar(i, vols[i], width=candle_width, color=color, alpha=0.85)
@@ -238,24 +302,19 @@ def generate_chart(
     ax_vol.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1000:.0f}k" if v > 1000 else f"{v:.0f}"))
 
     # ── CVD line ─────────────────────────────────────────────────────────
-    cvd_color_arr = [COLOR_BULL_CVD if cvd[i] >= (cvd[i-1] if i > 0 else 0) else COLOR_BEAR_CVD for i in range(n)]
-    ax_cvd.fill_between(xs, cvd, 0, where=[c > 0 for c in cvd],
-                        color=COLOR_BULL_CVD, alpha=0.25)
-    ax_cvd.fill_between(xs, cvd, 0, where=[c < 0 for c in cvd],
-                        color=COLOR_BEAR_CVD, alpha=0.25)
+    ax_cvd.fill_between(xs, cvd, 0, where=[c > 0 for c in cvd], color=COLOR_BULL_CVD, alpha=0.25)
+    ax_cvd.fill_between(xs, cvd, 0, where=[c < 0 for c in cvd], color=COLOR_BEAR_CVD, alpha=0.25)
     ax_cvd.plot(xs, cvd, color=COLOR_GOLD, linewidth=1.5, alpha=0.9)
     ax_cvd.axhline(0, color=COLOR_MUTED, linewidth=0.6, alpha=0.5)
     ax_cvd.set_ylabel("CVD", color=COLOR_MUTED, fontsize=7)
-
-    # CVD label
     cvd_now = cvd[-1]
     cvd_color = COLOR_BULL_CVD if cvd_now >= 0 else COLOR_BEAR_CVD
     ax_cvd.text(n - 0.5, cvd_now, f"  {cvd_now:+.0f}",
                 color=cvd_color, fontsize=8, fontweight="bold", va="center")
 
-    # ── X-axis labels (time) ─────────────────────────────────────────────
+    # ── X-axis time labels ────────────────────────────────────────────────
     step = max(n // 8, 1)
-    tick_pos   = list(range(0, n, step))
+    tick_pos = list(range(0, n, step))
     tick_labels = []
     for i in tick_pos:
         try:
@@ -263,29 +322,85 @@ def generate_chart(
             tick_labels.append(dt.strftime("%m/%d\n%H:%M"))
         except Exception:
             tick_labels.append(str(i))
-
     ax_cvd.set_xticks(tick_pos)
     ax_cvd.set_xticklabels(tick_labels, fontsize=7, color=COLOR_MUTED)
 
+    # ── Volume Profile Heatmap (RIGHT panel) ─────────────────────────────
+    if vp_profile:
+        price_levels = sorted(vp_profile.keys())
+        vol_values   = [vp_profile[p] for p in price_levels]
+        max_vol = max(vol_values) if vol_values else 1.0
+
+        # Tô màu từng mức giá theo volume — inferno colormap
+        import matplotlib.cm as cm
+        cmap = cm.get_cmap("inferno")
+        for price_lvl, vol in zip(price_levels, vol_values):
+            intensity = vol / max_vol  # 0 → 1
+            color_rgba = cmap(intensity)
+            ax_heat.barh(
+                price_lvl, vol / max_vol,
+                height=vp_tick * 0.95,
+                color=color_rgba,
+                alpha=0.9,
+                left=0
+            )
+
+        # POC line — vàng, nổi bật
+        ax_heat.axhline(poc_price, color=COLOR_GOLD, linewidth=2.0,
+                        alpha=0.95, linestyle="-", zorder=10)
+        ax_heat.text(0.95, poc_price, f" POC\n {poc_price:.1f}",
+                     color=COLOR_GOLD, fontsize=7, fontweight="bold",
+                     va="center", ha="right", transform=ax_heat.get_yaxis_transform())
+
+        # Value Area bands — xanh nhạt
+        ax_heat.axhspan(val, vah, color="#1e3a5f", alpha=0.2, zorder=1)
+        ax_heat.axhline(vah, color="#58a6ff", linewidth=0.8, linestyle="--", alpha=0.7)
+        ax_heat.axhline(val, color="#58a6ff", linewidth=0.8, linestyle="--", alpha=0.7)
+
+        # Current price line
+        ax_heat.axhline(last_price, color=last_color, linewidth=1.2,
+                        linestyle=":", alpha=0.9, zorder=11)
+
+        # Đồng bộ y-axis với chart nến
+        y_min = min(lows)
+        y_max = max(highs)
+        y_pad = (y_max - y_min) * 0.05
+        ax_heat.set_ylim(y_min - y_pad, y_max + y_pad)
+        ax_candle.set_ylim(y_min - y_pad, y_max + y_pad)
+
+        # Style
+        ax_heat.set_xlim(0, 1.05)
+        ax_heat.set_xticks([])
+        ax_heat.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}"))
+        ax_heat.yaxis.tick_right()
+        ax_heat.tick_params(axis="y", labelsize=7, colors=COLOR_MUTED)
+        ax_heat.set_title("Volume\nProfile", color=COLOR_MUTED, fontsize=8, pad=4)
+
+        # Colorbar mini (legend nhiệt độ)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, max_vol))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax_heat, fraction=0.06, pad=0.04, aspect=30)
+        cbar.set_label("Volume", color=COLOR_MUTED, fontsize=7)
+        cbar.ax.tick_params(colors=COLOR_MUTED, labelsize=6)
+
     # ── Title ─────────────────────────────────────────────────────────────
-    now_str  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    price_str = f"{last_price:.2f}"
+    now_str   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     change    = closes[-1] - opens[0]
     pct       = change / opens[0] * 100
     change_str = f"{change:+.2f} ({pct:+.2f}%)"
     change_col = COLOR_BULL if change >= 0 else COLOR_BEAR
 
-    fig.text(0.06, 0.955, f"{symbol}", fontsize=16, fontweight="bold",
+    fig.text(0.05, 0.96, f"{symbol}", fontsize=16, fontweight="bold",
              color=COLOR_TEXT, va="top")
-    fig.text(0.18, 0.958, price_str, fontsize=14, fontweight="bold",
+    fig.text(0.16, 0.963, f"{last_price:.2f}", fontsize=14, fontweight="bold",
              color=last_color, va="top")
-    fig.text(0.30, 0.958, change_str, fontsize=11,
-             color=change_col, va="top")
-    fig.text(0.97, 0.958, f"M15 • {now_str} • ATTRAOS Hub v1.1",
+    fig.text(0.27, 0.963, change_str, fontsize=11, color=change_col, va="top")
+    fig.text(0.98, 0.963, f"M15 • {now_str} • ATTRAOS Hub v1.1",
              fontsize=8, color=COLOR_MUTED, va="top", ha="right")
 
     # ── Save ──────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(output_path), exist_ok=True) if os.path.dirname(output_path) else None
+    if os.path.dirname(output_path):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=COLOR_BG, edgecolor="none")
     plt.close(fig)
