@@ -115,11 +115,20 @@ async def lifespan(app: FastAPI):
     # Start background file reader cho MT5 data
     import asyncio
     task = asyncio.create_task(_poll_mt5_file())
+    # Start Bookmap AI Council background loop
+    try:
+        from bookmap_council import council_background_loop
+        council_task = asyncio.create_task(council_background_loop(market))
+        print("   Council:    ✅ (3-Stage AI Council — 5min refresh)")
+    except Exception as e:
+        council_task = None
+        print(f"   Council:    ⚠️ {e}")
     print("   Hub DB:     ✅")
     print("   Scheduler:  ✅ (AI 15min / News 30min)")
     print(f"   MT5 file poll: ✅ ({_MT5_COMMON_FILE})")
     yield
     task.cancel()
+    if council_task: council_task.cancel()
     print("👋 Hub Server shutting down")
 
 
@@ -230,6 +239,40 @@ async def root():
         "api_docs": "/docs",
         "time": datetime.now().isoformat(),
     }
+
+
+# ─── Bookmap AI Council — iOS app polls này ────────────────────────────────────
+@app.get("/orderflow/council")
+async def get_orderflow_council(symbol: str = "XAUUSD"):
+    """
+    Kết quả 3-Stage AI Council tự động (Floor Trader + Profile Analyst + Risk Desk).
+    Background loop cập nhật mỗi 5 phút — iOS app poll là nhận ngay.
+    Không random, không fake — 100% từ Order Flow + Volume Profile thật.
+    """
+    try:
+        from bookmap_council import get_council_cache
+        cache = get_council_cache()
+        sym = symbol.replace("/", "").upper()
+
+        # Tìm trong cache theo symbol
+        for key in [symbol, sym, sym[:6]]:
+            if key in cache:
+                return cache[key]
+
+        # Chưa có cache → trigger ngay 1 lần (async)
+        return {
+            "symbol": symbol,
+            "status": "initializing",
+            "message": "Hội Đồng AI đang khởi động phân tích đầu tiên (≈30 giây). Vui lòng thử lại.",
+            "council": {
+                "action": "WAIT",
+                "confidence": 0,
+                "reasoning_vi": "Đang phân tích dữ liệu Order Flow. Thử lại sau 30 giây.",
+            },
+            "updated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Council error: {e}")
 
 
 
