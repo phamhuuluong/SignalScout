@@ -360,8 +360,44 @@ async def get_bookmap_image(symbol: str = "XAUUSD"):
 
 
 
+# ─── Auto-Deploy Webhook — GitHub → VPS tự cập nhật ──────────────────────────
+@app.post("/webhook/deploy")
+async def github_webhook(request: Request):
+    """
+    GitHub webhook: moi khi push len repo, VPS tu dong git pull + restart.
+    Khong can ai SSH len lam thu cong nua.
+    Setup: GitHub repo → Settings → Webhooks → URL: https://hub.lomofx.com/webhook/deploy
+    """
+    import subprocess, os, hmac, hashlib, asyncio
 
+    # Verify GitHub secret (tuy chon, bao mat hon)
+    secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+    if secret:
+        sig = request.headers.get("X-Hub-Signature-256", "")
+        body = await request.body()
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(401, "Invalid signature")
 
+    payload = await request.json() if not secret else {}
+    branch = payload.get("ref", "refs/heads/main")
+    if "main" not in branch:
+        return {"status": "skipped", "reason": "not main branch"}
+
+    # Chay git pull trong background
+    async def do_deploy():
+        try:
+            result = subprocess.run(
+                ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "pull", "origin", "main"],
+                capture_output=True, text=True, timeout=60
+            )
+            print(f"[AUTO-DEPLOY] git pull: {result.stdout.strip()} {result.stderr.strip()}")
+            # Reload modules (server tu dong pick up file moi vi uvicorn --reload)
+        except Exception as e:
+            print(f"[AUTO-DEPLOY] Error: {e}")
+
+    asyncio.create_task(do_deploy())
+    return {"status": "deployed", "branch": branch}
 
 
 # ─── Broadcast — iOS app polls this ───────────────────
