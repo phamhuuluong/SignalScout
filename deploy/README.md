@@ -20,10 +20,13 @@
 SSH vào VPS rồi chạy lần lượt:
 
 ```bash
-# 1. Vào thư mục Hub
+# ─── Lần đầu tiên (chỉ làm 1 lần) ───────────────────────────
+# Clone toàn bộ code từ GitHub về VPS (không cần gửi file qua Telegram)
+git clone https://github.com/phamhuuluong/SignalScout.git ~/SignalScout
 cd ~/SignalScout
 
-# 2. Pull code mới nhất từ GitHub
+# ─── Mỗi lần cập nhật sau này ─────────────────────────────────
+cd ~/SignalScout
 git pull origin main
 
 # 3. Cài thêm thư viện vẽ hình (chỉ cần làm 1 lần)
@@ -40,6 +43,7 @@ pm2 restart hub
 pkill -f "uvicorn server"
 nohup uvicorn server:app --host 0.0.0.0 --port 8001 &
 ```
+
 
 ---
 
