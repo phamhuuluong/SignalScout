@@ -1,307 +1,482 @@
 """
-Order Flow Analyzer — ATTRAOS Hub
-Phát hiện các hiện tượng Order Flow theo chiến lược Bookmap:
-- Iceberg Orders
-- Absorption
-- Spoofing
-- CVD Delta Imbalance
-- Liquidity Hunt
+order_flow_analyzer.py — ATTRAOS Hub v1.1
+Real Order Flow Analysis từ OHLCV thật (không random, không simulation).
+
+Thuật toán:
+- CVD (Cumulative Volume Delta) từ candle data: nến tăng → buy vol, nến giảm → sell vol
+- Absorption: volume lớn + body nhỏ (< 30% range) → lực đang bị hấp thụ
+- Iceberg: volume spike tại cùng mức giá liên tiếp → lệnh ẩn
+- Stop Hunt: spike qua swing high/low rồi đóng cửa trong range cũ
+- Delta Divergence: CVD trend ≠ Price trend → phân kỳ thật
 """
 
-import numpy as np
-from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import List, Optional
-import time
+import statistics
 
-
-# ─────────────────────────────────────────────
-#  Data Structures
-# ─────────────────────────────────────────────
+# ─── Data Structures ──────────────────────────────────────────────────────────
 
 @dataclass
-class L2Level:
-    price: float
-    bid_volume: float
-    ask_volume: float
-    timestamp: float = field(default_factory=time.time)
-
-
-@dataclass
-class TradeEvent:
-    price: float
+class Candle:
+    time: int         # Unix timestamp
+    open: float
+    high: float
+    low: float
+    close: float
     volume: float
-    side: str          # 'buy' or 'sell'
-    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def body(self) -> float:
+        return abs(self.close - self.open)
+
+    @property
+    def range(self) -> float:
+        r = self.high - self.low
+        return r if r > 0 else 0.0001
+
+    @property
+    def body_ratio(self) -> float:
+        """body / range — nhỏ = doji/absorption, lớn = momentum mạnh"""
+        return self.body / self.range
+
+    @property
+    def is_bullish(self) -> bool:
+        return self.close >= self.open
+
+    @property
+    def delta(self) -> float:
+        """Volume delta ước tính: +vol nếu nến tăng, -vol nếu giảm.
+        Nhân với body_ratio để phản ánh cường độ."""
+        sign = 1.0 if self.is_bullish else -1.0
+        return sign * self.volume * self.body_ratio
+
+    @property
+    def upper_wick(self) -> float:
+        return self.high - max(self.open, self.close)
+
+    @property
+    def lower_wick(self) -> float:
+        return min(self.open, self.close) - self.low
 
 
 @dataclass
-class OrderFlowSignal:
-    pattern: str       # 'ICEBERG' | 'ABSORPTION' | 'SPOOF' | 'HUNT' | 'DELTA_DIV'
-    direction: str     # 'BULLISH' | 'BEARISH' | 'NEUTRAL'
-    strength: int      # 0-100
+class OFSignal:
+    pattern: str      # ICEBERG | ABSORPTION | STOP_HUNT | DELTA_DIV | SPOOF_HINT
+    direction: str    # BULLISH | BEARISH | NEUTRAL
+    strength: int     # 0-100
     price: float
     description: str
-    timestamp: float = field(default_factory=time.time)
 
 
-# ─────────────────────────────────────────────
-#  Order Flow Analyzer Core
-# ─────────────────────────────────────────────
+@dataclass
+class OFDelta:
+    cvd: float
+    direction: str
+    divergence: bool
+    buy_pct: float
+    sell_pct: float
+    divergence_desc: str
+
+
+@dataclass
+class OFSnapshot:
+    current_price: float
+    overall_bias: str
+    signals: List[OFSignal]
+    delta: OFDelta
+    signal_count: int
+    top_signal: str
+
+
+# ─── Core Analyzer ─────────────────────────────────────────────────────────────
 
 class OrderFlowAnalyzer:
-    def __init__(self, window_size: int = 200):
-        self.window_size = window_size
+    def __init__(self, candles_m15: List[dict], candles_h1: List[dict], symbol: str = "XAUUSD"):
+        self.symbol = symbol
+        self.m15 = [self._to_candle(c) for c in candles_m15] if candles_m15 else []
+        self.h1  = [self._to_candle(c) for c in candles_h1]  if candles_h1  else []
 
-        # L2 snapshot history: price → list of volumes over time
-        self.bid_history: dict[float, deque] = defaultdict(lambda: deque(maxlen=window_size))
-        self.ask_history: dict[float, deque] = defaultdict(lambda: deque(maxlen=window_size))
+    def _to_candle(self, d: dict) -> Candle:
+        return Candle(
+            time=int(d.get("t", 0)),
+            open=float(d.get("o", 0)),
+            high=float(d.get("h", 0)),
+            low=float(d.get("l", 0)),
+            close=float(d.get("c", 0)),
+            volume=max(float(d.get("v", 1)), 1.0)
+        )
 
-        # Trade tape
-        self.trade_tape: deque[TradeEvent] = deque(maxlen=window_size)
+    # ── CVD calculation ─────────────────────────────────────────────────────
 
-        # CVD (Cumulative Volume Delta)
-        self.cvd: float = 0.0
-        self.cvd_history: deque[float] = deque(maxlen=window_size)
-        self.price_history: deque[float] = deque(maxlen=window_size)
+    def compute_cvd_series(self, candles: List[Candle]) -> List[float]:
+        """Tính CVD tích lũy từ từng nến."""
+        cvd = 0.0
+        series = []
+        for c in candles:
+            cvd += c.delta
+            series.append(cvd)
+        return series
 
-        # Iceberg tracking: price → refill count
-        self.refill_count: dict[float, int] = defaultdict(int)
-        self.prev_l2: dict[float, tuple] = {}   # price → (bid_vol, ask_vol)
+    def compute_buy_sell_volumes(self, candles: List[Candle]):
+        """Tổng buy vol / sell vol từ toàn bộ candle set."""
+        buy_vol = sum(c.volume * c.body_ratio for c in candles if c.is_bullish)
+        sell_vol = sum(c.volume * c.body_ratio for c in candles if not c.is_bullish)
+        return buy_vol, sell_vol
 
-    # ─── Feed Data ───────────────────────────
+    # ── Pattern Detectors ───────────────────────────────────────────────────
 
-    def feed_l2(self, levels: List[L2Level]):
-        """Nhập snapshot L2 mới từ Hub/Binance."""
-        for lvl in levels:
-            self.bid_history[lvl.price].append(lvl.bid_volume)
-            self.ask_history[lvl.price].append(lvl.ask_volume)
+    def detect_absorption(self, candles: List[Candle]) -> Optional[OFSignal]:
+        """
+        Absorption: nến có volume > 1.5× trung bình nhưng body < 25% range.
+        Tức là lực lớn nhưng giá không đi được xa → đang bị hấp thụ.
+        """
+        if len(candles) < 10:
+            return None
 
-            # Iceberg refill detection: giá bị xóa sạch rồi lại xuất hiện
-            prev = self.prev_l2.get(lvl.price)
-            if prev is not None:
-                prev_bid, prev_ask = prev
-                # Refill: volume lớn xuất hiện lại sau khi giảm về gần 0
-                if prev_bid < 5 and lvl.bid_volume > 20:
-                    self.refill_count[lvl.price] += 1
-                if prev_ask < 5 and lvl.ask_volume > 20:
-                    self.refill_count[lvl.price] += 1
-            self.prev_l2[lvl.price] = (lvl.bid_volume, lvl.ask_volume)
+        recent = candles[-20:]
+        avg_vol = statistics.mean(c.volume for c in recent)
+        
+        # Tìm nến absorption mạnh nhất trong 5 nến gần nhất
+        best = None
+        best_score = 0
+        for c in candles[-5:]:
+            if c.volume < avg_vol * 1.5:
+                continue
+            if c.body_ratio > 0.30:
+                continue
+            # Tỉ lệ vol/avgvol càng cao, body càng nhỏ → absorption càng mạnh
+            score = (c.volume / avg_vol) * (1.0 - c.body_ratio)
+            if score > best_score:
+                best_score = score
+                best = c
 
-    def feed_trade(self, trade: TradeEvent):
-        """Nhập lệnh đã khớp từ tape."""
-        self.trade_tape.append(trade)
-        if trade.side == 'buy':
-            self.cvd += trade.volume
+        if best is None or best_score < 1.5:
+            return None
+
+        strength = min(int((best_score - 1.5) / 3.0 * 100), 98)
+        # Direction: nếu price đang giảm mà absorption xảy ra → BULLISH (mua đang hấp thụ áp lực bán)
+        last_3 = candles[-3:]
+        price_down = all(c.close < c.open for c in last_3)
+        price_up   = all(c.close > c.open for c in last_3)
+        direction = "BULLISH" if price_down else ("BEARISH" if price_up else "NEUTRAL")
+
+        return OFSignal(
+            pattern="ABSORPTION",
+            direction=direction,
+            strength=max(strength, 55),
+            price=best.close,
+            description=f"Nến khổng lồ vol={best.volume:.0f} ({best.volume/avg_vol:.1f}×TB) nhưng body chỉ {best.body_ratio*100:.0f}% range → lực đang bị hấp thụ, sắp đảo chiều"
+        )
+
+    def detect_iceberg(self, candles: List[Candle]) -> Optional[OFSignal]:
+        """
+        Iceberg: nhiều nến liên tiếp test cùng mức giá (high hoặc low) với volume cao
+        nhưng không thể break qua → lệnh ẩn đang đặt tại đó.
+        """
+        if len(candles) < 8:
+            return None
+
+        recent = candles[-10:]
+        avg_vol = statistics.mean(c.volume for c in candles[-20:]) if len(candles) >= 20 else statistics.mean(c.volume for c in candles)
+
+        # Nhóm các mức high/low gần nhau (trong 0.1% giá)
+        tolerance = recent[-1].close * 0.001
+
+        # Test resistance (Iceberg bán ở đỉnh)
+        highs = [c.high for c in recent[-5:]]
+        if max(highs) - min(highs) < tolerance:
+            # Cùng mức high → resistance iceberg
+            high_vols = [c.volume for c in recent[-5:]]
+            avg_high_vol = statistics.mean(high_vols)
+            if avg_high_vol > avg_vol * 1.2:
+                strength = min(int((avg_high_vol / avg_vol - 1.0) * 60), 92)
+                level = statistics.mean(highs)
+                return OFSignal(
+                    pattern="ICEBERG",
+                    direction="BEARISH",
+                    strength=max(strength, 62),
+                    price=level,
+                    description=f"5 nến liên tiếp test vùng kháng cự {level:.2f} với volume cao ({avg_high_vol:.0f}) → Iceberg bán tại đỉnh, thị trường khó vượt"
+                )
+
+        # Test support (Iceberg mua ở đáy)
+        lows = [c.low for c in recent[-5:]]
+        if max(lows) - min(lows) < tolerance:
+            low_vols = [c.volume for c in recent[-5:]]
+            avg_low_vol = statistics.mean(low_vols)
+            if avg_low_vol > avg_vol * 1.2:
+                strength = min(int((avg_low_vol / avg_vol - 1.0) * 60), 92)
+                level = statistics.mean(lows)
+                return OFSignal(
+                    pattern="ICEBERG",
+                    direction="BULLISH",
+                    strength=max(strength, 62),
+                    price=level,
+                    description=f"5 nến liên tiếp giữ vùng hỗ trợ {level:.2f} với volume cao ({avg_low_vol:.0f}) → Iceberg mua tại đáy, cá vờ đang bảo vệ"
+                )
+
+        return None
+
+    def detect_stop_hunt(self, candles: List[Candle]) -> Optional[OFSignal]:
+        """
+        Stop Hunt: nến đột ngột spike qua swing high/low (wick dài > 60% range)
+        rồi đóng cửa bên trong range cũ + volume cao.
+        """
+        if len(candles) < 15:
+            return None
+
+        avg_vol = statistics.mean(c.volume for c in candles[-20:]) if len(candles) >= 20 else statistics.mean(c.volume for c in candles)
+
+        # Tính swing high/low từ 10-20 nến trước
+        lookback = candles[-15:-1]
+        swing_high = max(c.high for c in lookback)
+        swing_low  = min(c.low  for c in lookback)
+
+        last = candles[-1]
+
+        # Stop Hunt ở đỉnh: spike lên trên swing_high rồi đóng cửa dưới
+        if last.high > swing_high and last.close < swing_high:
+            hunt_size = (last.high - swing_high) / last.range
+            vol_ratio = last.volume / avg_vol
+            if hunt_size > 0.15 and vol_ratio > 1.3:
+                strength = min(int(hunt_size * 200 + vol_ratio * 20), 95)
+                return OFSignal(
+                    pattern="STOP_HUNT",
+                    direction="BEARISH",
+                    strength=max(strength, 70),
+                    price=last.high,
+                    description=f"Spike phá đỉnh {swing_high:.2f} rồi reject ngay — Stop Hunt bẫy lệnh BUY, Smart Money đang bán"
+                )
+
+        # Stop Hunt ở đáy: spike xuống dưới swing_low rồi đóng cửa trên
+        if last.low < swing_low and last.close > swing_low:
+            hunt_size = (swing_low - last.low) / last.range
+            vol_ratio = last.volume / avg_vol
+            if hunt_size > 0.15 and vol_ratio > 1.3:
+                strength = min(int(hunt_size * 200 + vol_ratio * 20), 95)
+                return OFSignal(
+                    pattern="STOP_HUNT",
+                    direction="BULLISH",
+                    strength=max(strength, 70),
+                    price=last.low,
+                    description=f"Spike phá đáy {swing_low:.2f} rồi reject ngay — Stop Hunt bẫy lệnh SELL, Smart Money đang mua"
+                )
+
+        return None
+
+    def detect_delta_divergence(self, candles: List[Candle]) -> Optional[OFSignal]:
+        """
+        Delta Divergence: CVD đang tăng nhưng giá giảm (hidden bearish)
+        hoặc CVD đang giảm nhưng giá tăng (hidden bullish).
+        """
+        if len(candles) < 20:
+            return None
+
+        recent = candles[-20:]
+        cvd_series = self.compute_cvd_series(recent)
+
+        # Slope của CVD và Price trong 10 nến gần nhất
+        cvd_start = cvd_series[-10] if len(cvd_series) >= 10 else cvd_series[0]
+        cvd_end   = cvd_series[-1]
+        price_start = recent[-10].close if len(recent) >= 10 else recent[0].close
+        price_end   = recent[-1].close
+
+        cvd_rising   = cvd_end > cvd_start
+        price_rising = price_end > price_start
+
+        # Phân kỳ: hướng trái ngược nhau
+        if cvd_rising and not price_rising:
+            magnitude = abs(cvd_end - cvd_start) / (abs(price_end - price_start) + 0.0001)
+            strength = min(int(magnitude * 10), 90)
+            if strength < 50:
+                return None
+            return OFSignal(
+                pattern="DELTA_DIV",
+                direction="BULLISH",
+                strength=max(strength, 65),
+                price=recent[-1].close,
+                description=f"CVD tăng {cvd_end-cvd_start:+.0f} nhưng giá giảm — Smart Money đang tích lũy bí mật, giá thật sắp theo CVD đi lên"
+            )
+
+        if not cvd_rising and price_rising:
+            magnitude = abs(cvd_end - cvd_start) / (abs(price_end - price_start) + 0.0001)
+            strength = min(int(magnitude * 10), 90)
+            if strength < 50:
+                return None
+            return OFSignal(
+                pattern="DELTA_DIV",
+                direction="BEARISH",
+                strength=max(strength, 65),
+                price=recent[-1].close,
+                description=f"CVD giảm {cvd_end-cvd_start:+.0f} nhưng giá tăng — Lực bán thực đang chiếm ưu thế, tăng là bẫy, chuẩn bị đảo chiều"
+            )
+
+        return None
+
+    def detect_volume_climax(self, candles: List[Candle]) -> Optional[OFSignal]:
+        """
+        Volume Climax: nến có volume cao nhất trong 50 nến gần nhất
+        → thường là điểm cạn kiệt lực (exhaustion), hay đảo chiều.
+        """
+        if len(candles) < 20:
+            return None
+
+        recent = candles[-50:] if len(candles) >= 50 else candles
+        max_vol_candle = max(recent, key=lambda c: c.volume)
+        # Chỉ report nếu nó là 1 trong 5 nến cuối
+        if max_vol_candle not in candles[-5:]:
+            return None
+
+        avg_vol = statistics.mean(c.volume for c in recent[:-1])
+        ratio = max_vol_candle.volume / avg_vol
+        if ratio < 2.5:
+            return None
+
+        direction = "BEARISH" if max_vol_candle.is_bullish else "BULLISH"
+        strength = min(int((ratio - 2.5) * 25 + 60), 90)
+
+        return OFSignal(
+            pattern="ABSORPTION",
+            direction=direction,
+            strength=max(strength, 65),
+            price=max_vol_candle.close,
+            description=f"Volume Climax: nến hiện tại có vol={max_vol_candle.volume:.0f} ({ratio:.1f}×TB) — Lực {'mua' if max_vol_candle.is_bullish else 'bán'} đang cạn kiệt, sắp đảo chiều"
+        )
+
+    # ── Main Analysis ───────────────────────────────────────────────────────
+
+    def analyze(self) -> OFSnapshot:
+        candles = self.m15  # Primary timeframe M15
+        if not candles:
+            candles = self.h1
+        if not candles:
+            return self._empty_snapshot()
+
+        current_price = candles[-1].close
+
+        # Tính CVD
+        cvd_series = self.compute_cvd_series(candles)
+        cvd_total  = cvd_series[-1] if cvd_series else 0.0
+        buy_vol, sell_vol = self.compute_buy_sell_volumes(candles)
+        total_vol = buy_vol + sell_vol
+        buy_pct  = (buy_vol / total_vol * 100) if total_vol > 0 else 50.0
+        sell_pct = 100.0 - buy_pct
+
+        # Chạy tất cả detectors
+        signals: List[OFSignal] = []
+        for detector in [
+            self.detect_delta_divergence,
+            self.detect_stop_hunt,
+            self.detect_absorption,
+            self.detect_iceberg,
+            self.detect_volume_climax,
+        ]:
+            try:
+                sig = detector(candles)
+                if sig:
+                    signals.append(sig)
+            except Exception:
+                pass
+
+        # Thêm H1 analysis cho context dài hạn hơn
+        if self.h1 and len(self.h1) >= 20:
+            for detector in [self.detect_delta_divergence, self.detect_stop_hunt]:
+                try:
+                    sig = detector(self.h1)
+                    if sig:
+                        # Tăng strength 10% cho H1 signals (timeframe cao hơn = quan trọng hơn)
+                        sig.strength = min(sig.strength + 10, 99)
+                        sig.description = f"[H1] {sig.description}"
+                        # Chỉ thêm nếu chưa có pattern giống rồi
+                        existing = [s.pattern for s in signals]
+                        if sig.pattern not in existing:
+                            signals.append(sig)
+                except Exception:
+                    pass
+
+        # Sort by strength
+        signals.sort(key=lambda s: s.strength, reverse=True)
+
+        # Overall bias
+        bullish_count = sum(1 for s in signals if s.direction == "BULLISH")
+        bearish_count = sum(1 for s in signals if s.direction == "BEARISH")
+        if bullish_count > bearish_count:
+            overall_bias = "BULLISH"
+        elif bearish_count > bullish_count:
+            overall_bias = "BEARISH"
         else:
-            self.cvd -= trade.volume
-        self.cvd_history.append(self.cvd)
-        self.price_history.append(trade.price)
+            # Dùng CVD để tiebreak
+            overall_bias = "BULLISH" if cvd_total > 0 else ("BEARISH" if cvd_total < 0 else "NEUTRAL")
 
-    # ─── Detectors ───────────────────────────
+        # Divergence
+        price_5 = candles[-5].close if len(candles) >= 5 else candles[0].close
+        price_now = candles[-1].close
+        cvd_5 = cvd_series[-5] if len(cvd_series) >= 5 else cvd_series[0]
+        cvd_now = cvd_series[-1]
+        divergence = (cvd_now > cvd_5 and price_now < price_5) or (cvd_now < cvd_5 and price_now > price_5)
+        if divergence:
+            if cvd_now > cvd_5:
+                div_desc = "CVD tăng nhưng giá giảm → lực mua thực sự đang ẩn, giá chuẩn bị theo CVD đi lên"
+            else:
+                div_desc = "CVD giảm nhưng giá tăng → lực bán thực đang chiếm ưu thế, tăng là bẫy"
+        else:
+            div_desc = "CVD và giá đang đồng thuận — xu hướng hiện tại đáng tin cậy"
 
-    def detect_icebergs(self, refill_threshold: int = 3) -> List[OrderFlowSignal]:
-        """Phát hiện Iceberg Orders — lệnh lớn bị chia nhỏ và nạp lại."""
-        signals = []
-        for price, count in self.refill_count.items():
-            if count >= refill_threshold:
-                # Xác định hướng: nếu nhiều bid refill → đây là vùng hỗ trợ âm mưu
-                bid_sum = sum(self.bid_history.get(price, [0]))
-                ask_sum = sum(self.ask_history.get(price, [0]))
-                direction = 'BULLISH' if bid_sum > ask_sum else 'BEARISH'
-                strength = min(100, count * 15)
-                signals.append(OrderFlowSignal(
-                    pattern='ICEBERG',
-                    direction=direction,
-                    strength=strength,
-                    price=price,
-                    description=f"Iceberg tại {price:.2f} — nạp lại {count} lần. "
-                                f"Hỗ trợ {'Mua' if direction == 'BULLISH' else 'Bán'} ẩn."
-                ))
-        # Reset sau khi báo (tránh báo liên tục)
-        self.refill_count.clear()
-        return signals
+        delta_info = OFDelta(
+            cvd=cvd_total,
+            direction="BULLISH" if cvd_total > 0 else ("BEARISH" if cvd_total < 0 else "NEUTRAL"),
+            divergence=divergence,
+            buy_pct=buy_pct,
+            sell_pct=sell_pct,
+            divergence_desc=div_desc
+        )
 
-    def detect_absorption(self, price: float, lookback: int = 20) -> Optional[OrderFlowSignal]:
-        """
-        Phát hiện Absorption — áp lực mạnh nhưng giá không đi được.
-        Dấu hiệu: CVD tăng mạnh (nhiều lệnh Buy thị trường) nhưng giá đứng yên hoặc đi ngang.
-        """
-        if len(self.cvd_history) < lookback or len(self.price_history) < lookback:
-            return None
+        top = signals[0].description if signals else "Không phát hiện tín hiệu Order Flow đặc biệt."
 
-        cvd_arr = np.array(list(self.cvd_history)[-lookback:])
-        price_arr = np.array(list(self.price_history)[-lookback:])
+        return OFSnapshot(
+            current_price=current_price,
+            overall_bias=overall_bias,
+            signals=signals,
+            delta=delta_info,
+            signal_count=len(signals),
+            top_signal=top
+        )
 
-        cvd_change = cvd_arr[-1] - cvd_arr[0]
-        price_change_pct = abs(price_arr[-1] - price_arr[0]) / max(price_arr[0], 0.01)
+    def _empty_snapshot(self) -> OFSnapshot:
+        return OFSnapshot(
+            current_price=0.0,
+            overall_bias="NEUTRAL",
+            signals=[],
+            delta=OFDelta(0, "NEUTRAL", False, 50, 50, "Không có dữ liệu"),
+            signal_count=0,
+            top_signal="Đang chờ dữ liệu MT5..."
+        )
 
-        # Nhiều lực mua nhưng giá không tăng → bên Bán đang hấp thụ
-        if cvd_change > 50 and price_change_pct < 0.001:
-            return OrderFlowSignal(
-                pattern='ABSORPTION',
-                direction='BEARISH',
-                strength=75,
-                price=price,
-                description=f"Absorption tại {price:.2f} — Lực mua mạnh nhưng giá bị chặn. "
-                            f"Seller đang hấp thụ toàn bộ. Cảnh báo đảo chiều xuống."
-            )
-        # Nhiều lực bán nhưng giá không giảm → bên Mua đang hấp thụ
-        if cvd_change < -50 and price_change_pct < 0.001:
-            return OrderFlowSignal(
-                pattern='ABSORPTION',
-                direction='BULLISH',
-                strength=75,
-                price=price,
-                description=f"Absorption tại {price:.2f} — Lực bán mạnh nhưng giá bị giữ. "
-                            f"Buyer đang hấp thụ toàn bộ. Cảnh báo đảo chiều lên."
-            )
-        return None
 
-    def detect_spoofing(self, large_volume_threshold: float = 100) -> List[OrderFlowSignal]:
-        """
-        Phát hiện Spoofing — lệnh lớn xuất hiện rồi biến mất.
-        Dấu hiệu: volume lớn ở L2 nhưng sau 1-2 tick thì biến mất mà không khớp lệnh.
-        """
-        signals = []
-        for price, bid_q in self.bid_history.items():
-            if len(bid_q) < 3:
-                continue
-            recent = list(bid_q)[-3:]
-            # Xuất hiện rồi biến mất: [lớn, lớn, nhỏ]
-            if recent[0] > large_volume_threshold and recent[1] > large_volume_threshold and recent[2] < 5:
-                signals.append(OrderFlowSignal(
-                    pattern='SPOOF',
-                    direction='BEARISH',   # Giả vờ mua để đẩy giá, thực ra muốn bán
-                    strength=65,
-                    price=price,
-                    description=f"⚠️ SPOOF tại BID {price:.2f} — Lệnh khủng biến mất! "
-                                f"Đây là bẫy — Bỏ qua tín hiệu mua vùng này."
-                ))
-        for price, ask_q in self.ask_history.items():
-            if len(ask_q) < 3:
-                continue
-            recent = list(ask_q)[-3:]
-            if recent[0] > large_volume_threshold and recent[1] > large_volume_threshold and recent[2] < 5:
-                signals.append(OrderFlowSignal(
-                    pattern='SPOOF',
-                    direction='BULLISH',   # Giả vờ bán để đẩy giá xuống, thực ra muốn mua
-                    strength=65,
-                    price=price,
-                    description=f"⚠️ SPOOF tại ASK {price:.2f} — Lệnh bán khủng biến mất! "
-                                f"Đây là bẫy — Bỏ qua tín hiệu bán vùng này."
-                ))
-        return signals
+# ─── Serialization helpers dùng cho FastAPI endpoint ──────────────────────────
 
-    def calculate_delta(self, lookback: int = 50) -> dict:
-        """
-        Tính CVD Delta và phát hiện phân kỳ với giá.
-        Trả về dict chứa cvd, direction, divergence.
-        """
-        if len(self.cvd_history) < 2:
-            return {"cvd": 0, "direction": "NEUTRAL", "divergence": False, "buy_pct": 50, "sell_pct": 50}
-
-        cvd_arr = np.array(list(self.cvd_history)[-min(lookback, len(self.cvd_history)):])
-        price_arr = np.array(list(self.price_history)[-min(lookback, len(self.price_history)):])
-
-        cvd_trend = cvd_arr[-1] - cvd_arr[0]
-        price_trend = price_arr[-1] - price_arr[0] if len(price_arr) > 1 else 0
-
-        # Phân kỳ: CVD tăng nhưng giá giảm = Bullish divergence (giả mạo xu hướng giảm)
-        divergence = (cvd_trend > 30 and price_trend < 0) or (cvd_trend < -30 and price_trend > 0)
-
-        # Tính % mua bán thực sự
-        buys = sum(t.volume for t in self.trade_tape if t.side == 'buy')
-        sells = sum(t.volume for t in self.trade_tape if t.side == 'sell')
-        total = buys + sells
-        buy_pct = round((buys / total * 100) if total > 0 else 50, 1)
-        sell_pct = round(100 - buy_pct, 1)
-
-        return {
-            "cvd": round(self.cvd, 2),
-            "direction": "BULLISH" if cvd_trend > 0 else "BEARISH",
-            "divergence": divergence,
-            "buy_pct": buy_pct,
-            "sell_pct": sell_pct,
-            "divergence_desc": (
-                "CVD tăng nhưng giá giảm → Lực mua thực sự vẫn mạnh, giảm là giả tạo!"
-                if cvd_trend > 0 and price_trend < 0
-                else "CVD giảm nhưng giá tăng → Lực bán thực sự đang chiếm ưu thế, tăng là bẫy!"
-                if cvd_trend < 0 and price_trend > 0
-                else "Không có phân kỳ — xu hướng giá và Delta đang đồng thuận."
-            ) if divergence else "Không có phân kỳ — xu hướng nhất quán."
-        }
-
-    def detect_liquidity_hunt(self, current_price: float) -> Optional[OrderFlowSignal]:
-        """
-        Phát hiện Stop Hunt / Liquidity Hunt — giá đột ngột xuyên vùng rồi quay lại.
-        Dấu hiệu: giá spike sharply qua một mức rồi quay lại trong 2-3 tick.
-        """
-        if len(self.price_history) < 5:
-            return None
-
-        prices = list(self.price_history)[-5:]
-        high = max(prices[:-1])
-        low = min(prices[:-1])
-        last = prices[-1]
-
-        # Spike lên rồi quay lại = Stop Hunt kiểu Buy Stop
-        if high > current_price * 1.002 and last < high * 0.999:
-            return OrderFlowSignal(
-                pattern='HUNT',
-                direction='BEARISH',
-                strength=70,
-                price=current_price,
-                description=f"Stop Hunt phía trên {high:.2f} — Buy Stops đã bị quét! "
-                            f"Cơ hội SELL sau khi retest. Entry tối ưu: {current_price:.2f}"
-            )
-        # Spike xuống rồi quay lại = Stop Hunt kiểu Sell Stop
-        if low < current_price * 0.998 and last > low * 1.001:
-            return OrderFlowSignal(
-                pattern='HUNT',
-                direction='BULLISH',
-                strength=70,
-                price=current_price,
-                description=f"Stop Hunt phía dưới {low:.2f} — Sell Stops đã bị quét! "
-                            f"Cơ hội BUY sau khi retest. Entry tối ưu: {current_price:.2f}"
-            )
-        return None
-
-    def get_all_signals(self, current_price: float) -> dict:
-        """Chạy tất cả detector và trả về dict tổng hợp."""
-        signals = []
-        signals.extend(self.detect_icebergs())
-        signals.extend(self.detect_spoofing())
-
-        abs_sig = self.detect_absorption(current_price)
-        if abs_sig:
-            signals.append(abs_sig)
-
-        hunt_sig = self.detect_liquidity_hunt(current_price)
-        if hunt_sig:
-            signals.append(hunt_sig)
-
-        delta = self.calculate_delta()
-
-        # Tổng hợp hướng chung từ các signals
-        bull_score = sum(s.strength for s in signals if s.direction == 'BULLISH')
-        bear_score = sum(s.strength for s in signals if s.direction == 'BEARISH')
-        overall = 'BULLISH' if bull_score > bear_score else ('BEARISH' if bear_score > bull_score else 'NEUTRAL')
-
-        return {
-            "current_price": current_price,
-            "overall_bias": overall,
-            "signals": [
-                {
-                    "pattern": s.pattern,
-                    "direction": s.direction,
-                    "strength": s.strength,
-                    "price": s.price,
-                    "description": s.description
-                }
-                for s in signals
-            ],
-            "delta": delta,
-            "signal_count": len(signals),
-            "top_signal": signals[0].description if signals else "Không phát hiện tín hiệu Order Flow đáng chú ý."
-        }
+def snapshot_to_dict(snap: OFSnapshot) -> dict:
+    return {
+        "current_price": snap.current_price,
+        "overall_bias": snap.overall_bias,
+        "signals": [
+            {
+                "pattern": s.pattern,
+                "direction": s.direction,
+                "strength": s.strength,
+                "price": s.price,
+                "description": s.description,
+            }
+            for s in snap.signals
+        ],
+        "delta": {
+            "cvd": snap.delta.cvd,
+            "direction": snap.delta.direction,
+            "divergence": snap.delta.divergence,
+            "buy_pct": snap.delta.buy_pct,
+            "sell_pct": snap.delta.sell_pct,
+            "divergence_desc": snap.delta.divergence_desc,
+        },
+        "signal_count": snap.signal_count,
+        "top_signal": snap.top_signal,
+    }
