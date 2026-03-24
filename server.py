@@ -237,31 +237,57 @@ async def root():
 @app.get("/orderflow/snapshot")
 async def get_orderflow_snapshot(symbol: str = "XAUUSD"):
     """
-    Phan tich Order Flow THAT tu OHLCV MT5.
-    Khong random, khong simulation — 100% tu data MT5 EA push len.
+    Phan tich Order Flow THAT tu OHLCV (TwelveData/Twelve + gia realtime MT5).
+    Khong random — toan bo tinh toan tu real OHLCV candle data.
     Phat hien: Absorption, Iceberg, Stop Hunt, Delta Divergence, Volume Climax.
     """
     try:
         from order_flow_analyzer import OrderFlowAnalyzer, snapshot_to_dict
 
-        # Lay candle data that tu MT5
+        # Map symbol sang dang API
+        symbol_clean = symbol.replace("/", "").upper()
+        if symbol_clean.startswith("XAU"):
+            api_symbol = "XAU/USD"
+        elif symbol_clean.startswith("XAG"):
+            api_symbol = "XAG/USD"
+        elif symbol_clean.startswith("DXY") or symbol_clean == "USDX":
+            api_symbol = "DXY"
+        elif len(symbol_clean) == 6:
+            api_symbol = f"{symbol_clean[:3]}/{symbol_clean[3:]}"
+        else:
+            api_symbol = symbol_clean
+
+        # Lay gia realtime tu MT5 (neu co)
         mt5_markets = _mt5_data.get("market", [])
         sym_data = next(
             (m for m in mt5_markets
-             if m.get("symbol", "").replace("/", "").upper()[:6] == symbol.replace("/", "").upper()[:6]),
+             if m.get("symbol", "").replace("/", "").upper()[:6] == symbol_clean[:6]),
             None
         )
+        bid = float(sym_data.get("bid", 0) or 0) if sym_data else 0.0
+        ask = float(sym_data.get("ask", 0) or 0) if sym_data else 0.0
+        current_price = (bid + ask) / 2 if bid > 0 else 0.0
 
-        candles_m15 = []
-        candles_h1  = []
-        current_price = 0.0
+        # Lay OHLCV thuc te tu TwelveData (luon co san, k can EA)
+        candles_obj_m15 = await market.fetch_candles(api_symbol, "15m", 100)
+        candles_obj_h1  = await market.fetch_candles(api_symbol, "1h",  50)
 
-        if sym_data:
-            candles_m15 = sym_data.get("m15") or []
-            candles_h1  = sym_data.get("h1")  or []
-            bid = float(sym_data.get("bid", 0) or 0)
-            ask = float(sym_data.get("ask", 0) or 0)
-            current_price = (bid + ask) / 2 if bid > 0 else bid
+        def to_analyzer_fmt(c_list):
+            result = []
+            for c in c_list:
+                d = c.to_dict() if hasattr(c, "to_dict") else c
+                result.append({
+                    "t": int(d.get("time", d.get("t", 0))),
+                    "o": float(d.get("open", d.get("o", 0))),
+                    "h": float(d.get("high", d.get("h", 0))),
+                    "l": float(d.get("low",  d.get("l", 0))),
+                    "c": float(d.get("close", d.get("c", 0))),
+                    "v": max(float(d.get("volume", d.get("v", 1)) or 1), 1.0),
+                })
+            return result
+
+        candles_m15 = to_analyzer_fmt(candles_obj_m15)
+        candles_h1  = to_analyzer_fmt(candles_obj_h1)
 
         if not candles_m15 and not candles_h1:
             return {
@@ -271,10 +297,10 @@ async def get_orderflow_snapshot(symbol: str = "XAUUSD"):
                 "delta": {
                     "cvd": 0, "direction": "NEUTRAL", "divergence": False,
                     "buy_pct": 50, "sell_pct": 50,
-                    "divergence_desc": "Dang cho du lieu MT5... Hay kiem tra EA Hub v3 dang chay."
+                    "divergence_desc": "Khong lay duoc du lieu nen. Kiem tra ket noi TwelveData."
                 },
                 "signal_count": 0,
-                "top_signal": "Chua co du lieu M15/H1 tu MT5. EA Hub can chay de truyen data."
+                "top_signal": "Khong co du lieu nen de phan tich."
             }
 
         analyzer = OrderFlowAnalyzer(
@@ -284,9 +310,11 @@ async def get_orderflow_snapshot(symbol: str = "XAUUSD"):
         )
         snapshot = analyzer.analyze()
 
-        # Override current_price bang gia thoi gian thuc neu co
+        # Override gia bang MT5 realtime neu co, neu khong dung close cua nen cuoi
         if current_price > 0:
             snapshot.current_price = current_price
+        elif candles_m15:
+            snapshot.current_price = candles_m15[-1]["c"]
 
         return snapshot_to_dict(snapshot)
 
@@ -300,18 +328,18 @@ async def get_orderflow_snapshot(symbol: str = "XAUUSD"):
             "delta": {
                 "cvd": 0, "direction": "NEUTRAL", "divergence": False,
                 "buy_pct": 50, "sell_pct": 50,
-                "divergence_desc": f"Loi he thong: {str(e)}"
+                "divergence_desc": f"Loi: {str(e)}"
             },
             "signal_count": 0,
-            "top_signal": f"Loi: {str(e)}"
+            "top_signal": f"Loi Order Flow: {str(e)}"
         }
 
 
 @app.get("/bookmap/latest.png")
 async def get_bookmap_image(symbol: str = "XAUUSD"):
     """
-    Render bieu do nen that (Japanese Candlestick + Volume + CVD) tu data MT5.
-    Khong con heatmap mo mo — day la chart that.
+    Render bieu do nen that (Japanese Candlestick + Volume + CVD) tu OHLCV thật.
+    Khong con heatmap demo — day la chart that.
     """
     from fastapi.responses import FileResponse
     import os
@@ -321,25 +349,37 @@ async def get_bookmap_image(symbol: str = "XAUUSD"):
     try:
         from bookmap_generator import generate_chart
 
-        # Lay M15 candle data that
-        mt5_markets = _mt5_data.get("market", [])
-        sym_data = next(
-            (m for m in mt5_markets
-             if m.get("symbol", "").replace("/", "").upper()[:6] == symbol.replace("/", "").upper()[:6]),
-            None
-        )
+        # Map symbol
+        symbol_clean = symbol.replace("/", "").upper()
+        if symbol_clean.startswith("XAU"):
+            api_symbol = "XAU/USD"
+        elif symbol_clean.startswith("XAG"):
+            api_symbol = "XAG/USD"
+        elif len(symbol_clean) == 6:
+            api_symbol = f"{symbol_clean[:3]}/{symbol_clean[3:]}"
+        else:
+            api_symbol = symbol_clean
 
-        candles_m15 = []
-        if sym_data:
-            candles_m15 = sym_data.get("m15") or []
+        candles_obj = await market.fetch_candles(api_symbol, "15m", 80)
+
+        def to_fmt(c_list):
+            result = []
+            for c in c_list:
+                d = c.to_dict() if hasattr(c, "to_dict") else c
+                result.append({
+                    "t": int(d.get("time", d.get("t", 0))),
+                    "o": float(d.get("open", d.get("o", 0))),
+                    "h": float(d.get("high", d.get("h", 0))),
+                    "l": float(d.get("low",  d.get("l", 0))),
+                    "c": float(d.get("close", d.get("c", 0))),
+                    "v": max(float(d.get("volume", d.get("v", 1)) or 1), 1.0),
+                })
+            return result
+
+        candles_m15 = to_fmt(candles_obj)
 
         if not candles_m15:
-            # Fallback: dung H1 neu chua co M15
-            if sym_data:
-                candles_m15 = sym_data.get("h1") or []
-
-        if not candles_m15:
-            raise HTTPException(503, f"Chua co du lieu nen cho {symbol}. Hay kiem tra EA Hub dang chay.")
+            raise HTTPException(503, f"Khong lay duoc du lieu nen cho {symbol}")
 
         result = generate_chart(
             candles_m15=candles_m15,
